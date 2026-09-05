@@ -406,6 +406,32 @@ func TestTranslatePrioritizesContextFailureOverHTTPStatus(t *testing.T) {
 	}
 }
 
+func TestTranslatePrioritizesContextCanceledDuringSuccessfulBodyReadOverHTTPStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	provider, err := New(Config{
+		APIKey: "key", Endpoint: "https://microsoft.test",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusForbidden,
+				Header:     make(http.Header),
+				Body: &cancelingReadCloser{
+					data:   []byte(`[]`),
+					cancel: cancel,
+				},
+			}, nil
+		})},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = provider.Translate(ctx, validRequest())
+	assertProviderError(t, err, lingomux.ErrorTimeout, http.StatusForbidden, true)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error does not retain context cancellation: %v", err)
+	}
+}
+
 func TestTranslateRejectsMalformedEmptyAndOversizedSuccessResponses(t *testing.T) {
 	tests := []struct {
 		name string
@@ -524,6 +550,26 @@ func (body *failingReadCloser) Read([]byte) (int, error) {
 }
 
 func (*failingReadCloser) Close() error {
+	return nil
+}
+
+type cancelingReadCloser struct {
+	data   []byte
+	cancel context.CancelFunc
+	read   bool
+}
+
+func (body *cancelingReadCloser) Read(destination []byte) (int, error) {
+	if body.read {
+		return 0, io.EOF
+	}
+	body.read = true
+	written := copy(destination, body.data)
+	body.cancel()
+	return written, io.EOF
+}
+
+func (*cancelingReadCloser) Close() error {
 	return nil
 }
 
