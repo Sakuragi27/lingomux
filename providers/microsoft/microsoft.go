@@ -60,6 +60,9 @@ func New(config Config) (*Provider, error) {
 		client = httpjson.NewClient()
 	}
 	clientCopy := *client
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	transport := client.Transport
 	if transport == nil {
 		transport = http.DefaultTransport

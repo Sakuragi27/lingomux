@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/Sakuragi27/lingomux"
@@ -260,6 +261,83 @@ func TestTranslateMapsHTTPFailures(t *testing.T) {
 			_, err = provider.Translate(context.Background(), validRequest())
 			assertProviderError(t, err, test.kind, test.status, test.retryable)
 			for _, secret := range []string{"api-secret", "source-secret", rawBody} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error leaked %q: %q", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTranslateDoesNotFollowRedirects(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+	}{
+		{name: "302 found", status: http.StatusFound},
+		{name: "307 temporary redirect", status: http.StatusTemporaryRedirect},
+		{name: "308 permanent redirect", status: http.StatusPermanentRedirect},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			const (
+				apiKey        = "redirect-api-key-secret"
+				redirectBody  = "redirect-body-secret"
+				locationQuery = "redirect-location-secret"
+			)
+			var sourceCalls atomic.Int32
+			var destinationCalls atomic.Int32
+			var callerRedirectPolicyCalls atomic.Int32
+			var destinationKey atomic.Value
+			var destinationBody atomic.Value
+			destinationKey.Store("")
+			destinationBody.Store("")
+
+			destination := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				destinationCalls.Add(1)
+				destinationKey.Store(request.Header.Get("Ocp-Apim-Subscription-Key"))
+				body, _ := io.ReadAll(request.Body)
+				destinationBody.Store(string(body))
+				_, _ = io.WriteString(writer, `[{"translations":[{"text":"redirected","to":"fr"}]}]`)
+			}))
+			defer destination.Close()
+
+			source := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				sourceCalls.Add(1)
+				writer.Header().Set("Location", destination.URL+"/leak?value="+locationQuery)
+				writer.WriteHeader(test.status)
+				_, _ = io.WriteString(writer, redirectBody)
+			}))
+			defer source.Close()
+
+			client := source.Client()
+			client.CheckRedirect = func(*http.Request, []*http.Request) error {
+				callerRedirectPolicyCalls.Add(1)
+				return nil
+			}
+			provider, err := New(Config{APIKey: apiKey, Endpoint: source.URL, HTTPClient: client})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			_, err = provider.Translate(context.Background(), validRequest())
+			assertProviderError(t, err, lingomux.ErrorProviderFailure, test.status, false)
+			if got := sourceCalls.Load(); got != 1 {
+				t.Errorf("source request count = %d, want 1", got)
+			}
+			if got := destinationCalls.Load(); got != 0 {
+				t.Errorf("redirect destination request count = %d, want 0", got)
+			}
+			if got := callerRedirectPolicyCalls.Load(); got != 0 {
+				t.Errorf("caller redirect policy calls = %d, want provider policy override", got)
+			}
+			if got := destinationKey.Load().(string); got != "" {
+				t.Errorf("redirect destination received subscription key %q", got)
+			}
+			if got := destinationBody.Load().(string); got != "" {
+				t.Errorf("redirect destination received request body %q", got)
+			}
+			for _, secret := range []string{apiKey, "source-secret", redirectBody, locationQuery} {
 				if strings.Contains(err.Error(), secret) {
 					t.Errorf("error leaked %q: %q", secret, err)
 				}
