@@ -467,3 +467,46 @@ func TestNewRejectsEmptyHostnameAndQueryDelimiter(t *testing.T) {
 		})
 	}
 }
+
+func TestTranslateRejectsInvalidRecognizedFieldsWithValidSiblings(t *testing.T) {
+	const validMessage = `{"type":"message","content":[{"type":"output_text","text":"Bonjour"}]}`
+	for _, test := range []struct{ name, invalidMessage string }{
+		{"null content", `{"type":"message","content":null}`},
+		{"missing content", `{"type":"message"}`},
+		{"object content", `{"type":"message","content":{}}`},
+		{"string content", `{"type":"message","content":"output-secret"}`},
+		{"null text", `{"type":"message","content":[{"type":"output_text","text":null},{"type":"output_text","text":"Bonjour"}]}`},
+		{"missing text", `{"type":"message","content":[{"type":"output_text"},{"type":"output_text","text":"Bonjour"}]}`},
+		{"numeric text", `{"type":"message","content":[{"type":"output_text","text":123}]}`},
+		{"boolean text", `{"type":"message","content":[{"type":"output_text","text":false}]}`},
+		{"object text", `{"type":"message","content":[{"type":"output_text","text":{}}]}`},
+		{"array text", `{"type":"message","content":[{"type":"output_text","text":[]}]}`},
+	} {
+		for _, invalidFirst := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/invalidFirst=%t", test.name, invalidFirst), func(t *testing.T) {
+				first, second := validMessage, test.invalidMessage
+				if invalidFirst {
+					first, second = second, first
+				}
+				server := responseServer(t, 200, `{"output":[`+first+","+second+`]}`)
+				result, err := newTestProvider(t, server, 0).Translate(context.Background(), validRequest())
+				assertProviderError(t, err, lingomux.ErrorProviderFailure, 200, true)
+				if result != (lingomux.ProviderResult{}) {
+					t.Errorf("returned partial translation: %#v", result)
+				}
+				assertPrivateError(t, err)
+			})
+		}
+	}
+}
+
+func TestTranslateIgnoresUnrelatedFieldsDuringStructuralValidation(t *testing.T) {
+	server := responseServer(t, 200, `{"output":[{"type":"reasoning","content":null},{"type":"tool","content":{"unrelated":true}},{"type":"message","content":[{"type":"refusal","text":null},{"type":"audio","text":{}},{"type":"output_text","text":"  Bonjour"},{"type":"output_text","text":"\nmonde  "}]}]}`)
+	result, err := newTestProvider(t, server, 0).Translate(context.Background(), validRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Text != "  Bonjour\nmonde  " {
+		t.Errorf("Text = %q", result.Text)
+	}
+}

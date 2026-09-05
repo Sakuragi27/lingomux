@@ -19,6 +19,7 @@ var (
 	errInvalidConfiguration = errors.New("openai: invalid configuration")
 	errUnsupportedLanguage  = errors.New("openai: unsupported language pair")
 	errEmptyTranslation     = errors.New("openai: empty translation response")
+	errInvalidResponse      = errors.New("openai: invalid translation response")
 )
 
 // Config configures the OpenAI translation provider. Model must be selected
@@ -167,15 +168,21 @@ func translatedText(response httpjson.Response) (string, error) {
 		if err := json.Unmarshal(output.Content, &content); err != nil {
 			return "", err
 		}
+		if content == nil {
+			return "", errInvalidResponse
+		}
 		for _, item := range content {
 			if item.Type != "output_text" {
 				continue
 			}
-			var fragment string
+			var fragment *string
 			if err := json.Unmarshal(item.Text, &fragment); err != nil {
 				return "", err
 			}
-			text.WriteString(fragment)
+			if fragment == nil {
+				return "", errInvalidResponse
+			}
+			text.WriteString(*fragment)
 		}
 	}
 	if strings.TrimSpace(text.String()) == "" {
