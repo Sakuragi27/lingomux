@@ -26,6 +26,9 @@ type Request struct {
 }
 
 func normalizeRequest(request Request, maxTextRunes int) (Request, error) {
+	if !utf8.ValidString(request.Text) {
+		return Request{}, invalidRequestError()
+	}
 	if !hasNonWhitespace(request.Text) {
 		return Request{}, invalidRequestError()
 	}

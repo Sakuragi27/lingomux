@@ -68,7 +68,7 @@ func IsKind(err error, kind ErrorKind) bool {
 	if err == nil {
 		return false
 	}
-	if typed, ok := err.(*Error); ok && typed.Kind == kind {
+	if typed, ok := err.(*Error); ok && typed != nil && typed.Kind == kind {
 		return true
 	}
 	if multiple, ok := err.(interface{ Unwrap() []error }); ok {
@@ -110,7 +110,7 @@ func (err *AggregateError) Error() string {
 
 func safeFailureSummary(failure ProviderFailure) string {
 	provider := failure.Provider
-	if typed, ok := failure.Error.(*Error); ok {
+	if typed, ok := failure.Error.(*Error); ok && typed != nil {
 		if provider == "" {
 			provider = typed.Provider
 		}

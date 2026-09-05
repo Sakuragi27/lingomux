@@ -16,6 +16,17 @@ func TestNormalizeRequestRejectsWhitespaceTextWithoutMutatingIt(t *testing.T) {
 	}
 }
 
+func TestNormalizeRequestRejectsInvalidUTF8WithoutMutatingIt(t *testing.T) {
+	request := Request{Text: "valid\xfftext", TargetLanguage: "en"}
+
+	if _, err := normalizeRequest(request, DefaultMaxTextRunes); err == nil {
+		t.Fatal("normalizeRequest accepted invalid UTF-8 text")
+	}
+	if request.Text != "valid\xfftext" {
+		t.Fatalf("request text was mutated to %q", request.Text)
+	}
+}
+
 func TestNormalizeRequestNormalizesDefaultsAndProviderName(t *testing.T) {
 	request := Request{
 		Text:           "Hello",
@@ -62,6 +73,20 @@ func TestNormalizeRequestDefaultsEmptyProviderToAuto(t *testing.T) {
 	}
 	if got.Provider != AutoProvider {
 		t.Fatalf("provider = %q, want %q", got.Provider, AutoProvider)
+	}
+}
+
+func TestNormalizeRequestRejectsInvalidProviderIdentifiers(t *testing.T) {
+	for _, provider := range []string{"gøøgle", "google cloud", "google!", "1google", "-google"} {
+		t.Run(provider, func(t *testing.T) {
+			_, err := normalizeRequest(Request{Text: "Hello", TargetLanguage: "en", Provider: provider}, DefaultMaxTextRunes)
+			if err == nil {
+				t.Fatalf("normalizeRequest accepted provider %q", provider)
+			}
+			if !IsKind(err, ErrorInvalidRequest) {
+				t.Fatalf("provider %q error kind = %v, want %q", provider, err, ErrorInvalidRequest)
+			}
+		})
 	}
 }
 

@@ -48,3 +48,15 @@ func TestAggregateErrorPreservesOrderedFailuresAndDoesNotExposeCauses(t *testing
 		t.Fatalf("AggregateError.Error() exposed cause content: %q", message)
 	}
 }
+
+func TestErrorHelpersHandleTypedNilErrors(t *testing.T) {
+	var typedNil *Error
+	if IsKind(typedNil, ErrorTimeout) {
+		t.Fatal("IsKind reported a kind for a typed-nil error")
+	}
+
+	aggregate := &AggregateError{Failures: []ProviderFailure{{Provider: "google", Error: typedNil}}}
+	if got, want := aggregate.Error(), "lingomux: all providers failed: google (provider_failure)"; got != want {
+		t.Fatalf("AggregateError.Error() = %q, want %q", got, want)
+	}
+}
