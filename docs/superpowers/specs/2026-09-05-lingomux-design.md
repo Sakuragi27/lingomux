@@ -71,8 +71,9 @@ The main types are:
 
 ```go
 const (
-    AutoLanguage = "auto"
-    AutoProvider = "auto"
+    AutoLanguage       = "auto"
+    AutoProvider       = "auto"
+    UndeterminedLanguage = "und"
 )
 
 type Request struct {
@@ -180,7 +181,7 @@ The maximum text length is configurable. LingoMux preserves the original text ex
 
 The public API uses canonical BCP 47-style language tags such as `en`, `zh-CN`, `zh-TW`, `ja`, and `pt-BR`, plus `auto` for source-language detection.
 
-Each provider adapter owns a table that converts canonical LingoMux tags to vendor-specific codes. It also converts a detected source language back to the canonical representation. Provider-specific language identifiers never escape through the root API.
+Each provider adapter owns a table that converts canonical LingoMux tags to vendor-specific codes. It also converts a detected source language back to the canonical representation. Provider-specific language identifiers never escape through the root API. If a provider cannot report a detected source language, the result uses `und`.
 
 The first release uses explicit mapping tables rather than guessing or automatically stripping regions. This avoids silently turning Traditional Chinese into Simplified Chinese or choosing the wrong Portuguese variant. Its guaranteed common mapping set is `en`, `zh-CN`, `zh-TW`, `ja`, `ko`, `fr`, `de`, `es`, `pt`, `pt-BR`, `it`, `ru`, `ar`, and `hi`; adapters can expose additional documented mappings.
 
