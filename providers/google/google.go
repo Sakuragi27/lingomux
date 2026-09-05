@@ -142,6 +142,11 @@ func (provider *Provider) Translate(ctx context.Context, request lingomux.Reques
 		)
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
+		if response.StatusCode == http.StatusForbidden && isQuotaError(response) {
+			return lingomux.ProviderResult{}, lingomux.NewProviderError(
+				lingomux.ErrorRateLimited, providerName, response.StatusCode, true, nil,
+			)
+		}
 		return lingomux.ProviderResult{}, mapHTTPError(response.StatusCode)
 	}
 
@@ -190,6 +195,31 @@ func invalidConfigurationError() *lingomux.Error {
 	return lingomux.NewProviderError(
 		lingomux.ErrorInvalidRequest, providerName, 0, false, errInvalidConfiguration,
 	)
+}
+
+// isQuotaError accepts only structured quota indicators from the bounded body.
+func isQuotaError(response httpjson.Response) bool {
+	var decoded struct {
+		Error struct {
+			Status string `json:"status"`
+			Errors []struct {
+				Reason string `json:"reason"`
+			} `json:"errors"`
+		} `json:"error"`
+	}
+	if err := response.DecodeJSON(&decoded); err != nil {
+		return false
+	}
+	if decoded.Error.Status == "RESOURCE_EXHAUSTED" {
+		return true
+	}
+	for _, detail := range decoded.Error.Errors {
+		switch detail.Reason {
+		case "dailyLimitExceeded", "userRateLimitExceeded", "rateLimitExceeded", "quotaExceeded":
+			return true
+		}
+	}
+	return false
 }
 
 func mapHTTPError(statusCode int) *lingomux.Error {

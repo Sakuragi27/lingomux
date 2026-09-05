@@ -305,6 +305,13 @@ func TestTranslatePrioritizesHTTPStatusOverResponseBodyFailures(t *testing.T) {
 			retryable: false,
 		},
 		{
+			name:      "403 with failing body reader",
+			status:    http.StatusForbidden,
+			body:      func() io.ReadCloser { return &failingReadCloser{err: readFailure} },
+			kind:      lingomux.ErrorAuthentication,
+			retryable: false,
+		},
+		{
 			name:      "403 with oversized body",
 			status:    http.StatusForbidden,
 			body:      oversizedResponseBody,
@@ -524,4 +531,51 @@ func (*cancelingReadCloser) Close() error {
 
 func oversizedResponseBody() io.ReadCloser {
 	return io.NopCloser(strings.NewReader(strings.Repeat("oversized-response-secret", 1+(1<<20)/len("oversized-response-secret"))))
+}
+
+func TestTranslateClassifiesStructured403QuotaErrors(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		status    int
+		body      string
+		kind      lingomux.ErrorKind
+		retryable bool
+	}{
+		{name: "daily limit", status: 403, body: `{"error":{"code":403,"message":"message-secret api-secret source-secret","errors":[{"domain":"usageLimits","reason":"dailyLimitExceeded"}]}}`, kind: lingomux.ErrorRateLimited, retryable: true},
+		{name: "user rate limit", status: 403, body: `{"error":{"code":403,"errors":[{"reason":"userRateLimitExceeded"}]}}`, kind: lingomux.ErrorRateLimited, retryable: true},
+		{name: "rate limit after unrelated reason", status: 403, body: `{"error":{"code":403,"errors":[{"reason":"unrelated-reason-secret"},{"reason":"rateLimitExceeded"}]}}`, kind: lingomux.ErrorRateLimited, retryable: true},
+		{name: "quota exhausted", status: 403, body: `{"error":{"code":403,"errors":[{"reason":"quotaExceeded"}]}}`, kind: lingomux.ErrorRateLimited, retryable: true},
+		{name: "resource exhausted status", status: 403, body: `{"error":{"code":403,"status":"RESOURCE_EXHAUSTED","message":"message-secret"}}`, kind: lingomux.ErrorRateLimited, retryable: true},
+		{name: "permission denied", status: 403, body: `{"error":{"code":403,"status":"PERMISSION_DENIED","errors":[{"reason":"forbidden"}],"message":"message-secret"}}`, kind: lingomux.ErrorAuthentication},
+		{name: "quota words only in message", status: 403, body: `{"error":{"message":"dailyLimitExceeded userRateLimitExceeded rateLimitExceeded quotaExceeded RESOURCE_EXHAUSTED","errors":[{"reason":"forbidden"}]}}`, kind: lingomux.ErrorAuthentication},
+		{name: "unrecognized reason", status: 403, body: `{"error":{"errors":[{"reason":"quotaExceeded-secret"}]}}`, kind: lingomux.ErrorAuthentication},
+		{name: "401 remains authentication", status: 401, body: `{"error":{"code":401,"status":"RESOURCE_EXHAUSTED","errors":[{"reason":"dailyLimitExceeded"}]}}`, kind: lingomux.ErrorAuthentication},
+		{name: "malformed JSON", status: 403, body: `{"error":{"errors":[{"reason":"dailyLimitExceeded"}]}`, kind: lingomux.ErrorAuthentication},
+		{name: "malformed reason", status: 403, body: `{"error":{"errors":[{"reason":123}]}}`, kind: lingomux.ErrorAuthentication},
+		{name: "malformed status", status: 403, body: `{"error":{"status":42}}`, kind: lingomux.ErrorAuthentication},
+		{name: "missing envelope", status: 403, body: `{}`, kind: lingomux.ErrorAuthentication},
+		{name: "null envelope", status: 403, body: `{"error":null}`, kind: lingomux.ErrorAuthentication},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(test.status)
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer server.Close()
+			provider, err := New(Config{APIKey: "api-secret", BaseURL: server.URL, HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := provider.Translate(context.Background(), validRequest())
+			assertProviderError(t, err, test.kind, test.status, test.retryable)
+			if result != (lingomux.ProviderResult{}) {
+				t.Errorf("returned a translation for failed response: %#v", result)
+			}
+			for _, secret := range []string{"api-secret", "source-secret", "message-secret", "unrelated-reason-secret", "dailyLimitExceeded", "userRateLimitExceeded", "rateLimitExceeded", "quotaExceeded", "RESOURCE_EXHAUSTED", "forbidden", test.body} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error leaked %q: %q", secret, err)
+				}
+			}
+		})
+	}
 }

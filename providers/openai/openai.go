@@ -148,6 +148,10 @@ func translationInstructions(source, target string) string {
 
 func translatedText(response httpjson.Response) (string, error) {
 	var decoded struct {
+		Status            string `json:"status"`
+		IncompleteDetails *struct {
+			Reason string `json:"reason"`
+		} `json:"incomplete_details"`
 		Output []struct {
 			Type    string          `json:"type"`
 			Content json.RawMessage `json:"content"`
@@ -155,6 +159,9 @@ func translatedText(response httpjson.Response) (string, error) {
 	}
 	if err := response.DecodeJSON(&decoded); err != nil {
 		return "", err
+	}
+	if decoded.Status != "completed" {
+		return "", errInvalidResponse
 	}
 	var text strings.Builder
 	for _, output := range decoded.Output {

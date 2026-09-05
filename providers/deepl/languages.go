@@ -115,5 +115,5 @@ var deepLToCanonical = map[string]string{
 	"TR": "tr",
 	"UK": "uk",
 	"VI": "vi",
-	"ZH": "zh-CN",
+	"ZH": "zh",
 }

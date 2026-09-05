@@ -152,7 +152,7 @@ func TestTranslateSendsResponsesContractAndTrustedInstructions(t *testing.T) {
 					t.Error("instructions is not a string")
 				}
 				instructions <- instruction
-				_, _ = io.WriteString(w, `{"output":[{"type":"reasoning","content":[{"type":"output_text","text":"ignored reasoning"}]},{"type":"message","content":[{"type":"refusal","refusal":"ignored"},{"type":"output_text","text":"  翻譯\n\t"}]}]}`)
+				_, _ = io.WriteString(w, `{"status":"completed","incomplete_details":null,"output":[{"type":"reasoning","content":[{"type":"output_text","text":"ignored reasoning"}]},{"type":"message","content":[{"type":"refusal","refusal":"ignored"},{"type":"output_text","text":"  翻譯\n\t"}]}]}`)
 			}))
 			defer server.Close()
 			provider := newTestProvider(t, server, test.tokens)
@@ -198,7 +198,7 @@ func TestTranslateSendsResponsesContractAndTrustedInstructions(t *testing.T) {
 }
 
 func TestTranslateCollectsOnlyMessageOutputText(t *testing.T) {
-	server := responseServer(t, 200, `{"output":[{"type":"tool","content":[{"type":"output_text","text":"ignore"}]},{"type":"message","content":[{"type":"refusal","text":"ignore"},{"type":"output_text","text":"  Bonjour"},{"type":"output_text","text":"\n"}]},{"type":"message","content":[{"type":"output_text","text":"monde  "}]}]}`)
+	server := responseServer(t, 200, `{"status":"completed","incomplete_details":null,"output":[{"type":"tool","content":[{"type":"output_text","text":"ignore"}]},{"type":"message","content":[{"type":"refusal","text":"ignore"},{"type":"output_text","text":"  Bonjour"},{"type":"output_text","text":"\n"}]},{"type":"message","content":[{"type":"output_text","text":"monde  "}]}]}`)
 	result, err := newTestProvider(t, server, 0).Translate(context.Background(), validRequest())
 	if err != nil {
 		t.Fatal(err)
@@ -210,14 +210,14 @@ func TestTranslateCollectsOnlyMessageOutputText(t *testing.T) {
 
 func TestTranslateRejectsInvalidOrEmptyResponses(t *testing.T) {
 	for _, test := range []struct{ name, body string }{
-		{"malformed", `{"output":`}, {"missing", `{}`}, {"null", `null`},
-		{"empty array", `{"output":[]}`}, {"wrong output shape", `{"output":{}}`},
-		{"empty message", `{"output":[{"type":"message","content":[]}]}`},
-		{"empty text", `{"output":[{"type":"message","content":[{"type":"output_text","text":""}]}]}`},
-		{"whitespace", `{"output":[{"type":"message","content":[{"type":"output_text","text":" \n\t　"}]}]}`},
-		{"wrong text shape", `{"output":[{"type":"message","content":[{"type":"output_text","text":123}]}]}`},
-		{"unrelated only", `{"output":[{"type":"reasoning","content":[{"type":"output_text","text":"output-secret"}]}]}`},
-		{"top-level convenience text", `{"output_text":"output-secret"}`},
+		{"malformed", `{"status":"completed","incomplete_details":null,"output":`}, {"missing", `{"status":"completed","incomplete_details":null}`}, {"null", `null`},
+		{"empty array", `{"status":"completed","incomplete_details":null,"output":[]}`}, {"wrong output shape", `{"status":"completed","incomplete_details":null,"output":{}}`},
+		{"empty message", `{"status":"completed","incomplete_details":null,"output":[{"type":"message","content":[]}]}`},
+		{"empty text", `{"status":"completed","incomplete_details":null,"output":[{"type":"message","content":[{"type":"output_text","text":""}]}]}`},
+		{"whitespace", `{"status":"completed","incomplete_details":null,"output":[{"type":"message","content":[{"type":"output_text","text":" \n\t　"}]}]}`},
+		{"wrong text shape", `{"status":"completed","incomplete_details":null,"output":[{"type":"message","content":[{"type":"output_text","text":123}]}]}`},
+		{"unrelated only", `{"status":"completed","incomplete_details":null,"output":[{"type":"reasoning","content":[{"type":"output_text","text":"output-secret"}]}]}`},
+		{"top-level convenience text", `{"status":"completed","incomplete_details":null,"output_text":"output-secret"}`},
 		{"oversized", strings.Repeat("output-secret", 1+httpjson.MaxResponseBytes/13)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -344,7 +344,7 @@ func TestTranslatePrioritizesContextAfterBodyReadAndWrappedContextErrors(t *test
 	for _, status := range []int{200, 403} {
 		for _, mode := range []string{"cancel on EOF", "cancel on close", "wrapped canceled", "wrapped deadline", "reader error"} {
 			t.Run(fmt.Sprintf("%d/%s", status, mode), func(t *testing.T) {
-				server := responseServer(t, status, `{"output":[{"type":"message","content":[{"type":"output_text","text":"output-secret"}]}]}`)
+				server := responseServer(t, status, `{"status":"completed","incomplete_details":null,"output":[{"type":"message","content":[{"type":"output_text","text":"output-secret"}]}]}`)
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
 				client := server.Client()
@@ -488,7 +488,7 @@ func TestTranslateRejectsInvalidRecognizedFieldsWithValidSiblings(t *testing.T) 
 				if invalidFirst {
 					first, second = second, first
 				}
-				server := responseServer(t, 200, `{"output":[`+first+","+second+`]}`)
+				server := responseServer(t, 200, `{"status":"completed","incomplete_details":null,"output":[`+first+","+second+`]}`)
 				result, err := newTestProvider(t, server, 0).Translate(context.Background(), validRequest())
 				assertProviderError(t, err, lingomux.ErrorProviderFailure, 200, true)
 				if result != (lingomux.ProviderResult{}) {
@@ -501,12 +501,51 @@ func TestTranslateRejectsInvalidRecognizedFieldsWithValidSiblings(t *testing.T) 
 }
 
 func TestTranslateIgnoresUnrelatedFieldsDuringStructuralValidation(t *testing.T) {
-	server := responseServer(t, 200, `{"output":[{"type":"reasoning","content":null},{"type":"tool","content":{"unrelated":true}},{"type":"message","content":[{"type":"refusal","text":null},{"type":"audio","text":{}},{"type":"output_text","text":"  Bonjour"},{"type":"output_text","text":"\nmonde  "}]}]}`)
+	server := responseServer(t, 200, `{"status":"completed","incomplete_details":null,"output":[{"type":"reasoning","content":null},{"type":"tool","content":{"unrelated":true}},{"type":"message","content":[{"type":"refusal","text":null},{"type":"audio","text":{}},{"type":"output_text","text":"  Bonjour"},{"type":"output_text","text":"\nmonde  "}]}]}`)
 	result, err := newTestProvider(t, server, 0).Translate(context.Background(), validRequest())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.Text != "  Bonjour\nmonde  " {
 		t.Errorf("Text = %q", result.Text)
+	}
+}
+
+func TestTranslateRejectsResponsesWithoutCompletedStatus(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		fields string
+	}{
+		{name: "incomplete at output limit", fields: `"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},`},
+		{name: "failed with partial output", fields: `"status":"failed","error":{"code":"server_error","message":"raw-body-secret"},`},
+		{name: "cancelled", fields: `"status":"cancelled",`},
+		{name: "queued", fields: `"status":"queued",`},
+		{name: "in progress", fields: `"status":"in_progress",`},
+		{name: "missing status"},
+		{name: "null status", fields: `"status":null,`},
+		{name: "empty status", fields: `"status":"",`},
+		{name: "numeric status", fields: `"status":123,`},
+		{name: "boolean status", fields: `"status":true,`},
+		{name: "object status", fields: `"status":{"state":"completed"},`},
+		{name: "array status", fields: `"status":["completed"],`},
+		{name: "unknown status", fields: `"status":"status-secret",`},
+		{name: "uppercase status", fields: `"status":"COMPLETED",`},
+		{name: "padded status", fields: `"status":" completed ",`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := "{" + test.fields + `"output":[{"type":"message","content":[{"type":"output_text","text":"output-secret"}]}]}`
+			server := responseServer(t, 200, body)
+			result, err := newTestProvider(t, server, 0).Translate(context.Background(), validRequest())
+			if result != (lingomux.ProviderResult{}) {
+				t.Errorf("returned partial translation: %#v", result)
+			}
+			assertProviderError(t, err, lingomux.ErrorProviderFailure, 200, true)
+			assertPrivateError(t, err)
+			for _, secret := range []string{"max_output_tokens", "status-secret", body} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error leaked %q: %q", secret, err)
+				}
+			}
+		})
 	}
 }

@@ -174,7 +174,7 @@ func TestTranslateMapsDirectionSpecificChineseAndPortugueseVariants(t *testing.T
 				if got := payload["target_lang"]; got != test.wantTarget {
 					t.Errorf("target_lang = %#v, want %q", got, test.wantTarget)
 				}
-				_, _ = io.WriteString(writer, `{"translations":[{"detected_source_language":"EN","text":"translated"}]}`)
+				_, _ = io.WriteString(writer, `{"translations":[{"detected_source_language":"ZH","text":"translated"}]}`)
 			}))
 			defer server.Close()
 
@@ -202,7 +202,7 @@ func TestTranslateMapsDetectedDeepLLanguagesToCanonical(t *testing.T) {
 		want     string
 	}{
 		{name: "English", detected: "EN", want: "en"},
-		{name: "Chinese", detected: "ZH", want: "zh-CN"},
+		{name: "Chinese without a script distinction", detected: "ZH", want: "zh"},
 		{name: "Portuguese", detected: "PT", want: "pt"},
 		{name: "unknown vendor code", detected: "XX-VENDOR", want: ""},
 	}
