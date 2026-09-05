@@ -2,6 +2,12 @@
 
 Date: 2026-09-05
 
+## Project metadata
+
+- Go module: `github.com/Sakuragi27/lingomux`
+- Minimum Go version: 1.26
+- License: MIT
+
 ## Overview
 
 LingoMux is a Go library that gives a business application one translation API while routing requests to multiple third-party translation providers. The first release supports Google Cloud Translation, Microsoft Azure AI Translator, DeepL, and OpenAI.
