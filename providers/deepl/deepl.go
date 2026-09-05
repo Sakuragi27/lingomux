@@ -114,6 +114,11 @@ func (provider *Provider) Translate(ctx context.Context, request lingomux.Reques
 	}
 
 	response, err := httpjson.Do(ctx, provider.httpClient, http.MethodPost, endpoint.String(), payload)
+	if ctx.Err() != nil {
+		return lingomux.ProviderResult{}, lingomux.NewProviderError(
+			lingomux.ErrorTimeout, providerName, response.StatusCode, true, ctx.Err(),
+		)
+	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
 			cause := err
