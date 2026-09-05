@@ -3,6 +3,8 @@ package lingomux
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -248,6 +250,29 @@ func TestTranslateExplicitReceivesTotalRemainingDeadline(t *testing.T) {
 	}
 }
 
+func TestTranslateTotalDeadlineIncludesProviderSupportCheck(t *testing.T) {
+	provider := &fakeProvider{
+		name: "slow-support",
+		supportsFn: func(_, _ string) bool {
+			time.Sleep(80 * time.Millisecond)
+			return true
+		},
+	}
+	client, err := New(WithProviders(provider), WithTimeout(20*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	_, err = client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr", Provider: "slow-support"})
+	assertErrorKind(t, err, ErrorTimeout)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Translate error = %v, want context deadline cause", err)
+	}
+	if provider.calls.Load() != 0 {
+		t.Fatalf("Translate called provider %d times after total timeout, want 0", provider.calls.Load())
+	}
+}
+
 func TestTranslateCallerCancellationWinsOverClientTimeout(t *testing.T) {
 	provider := &fakeProvider{
 		name: "cancel",
@@ -316,6 +341,69 @@ func TestTranslateRejectsEmptyProviderText(t *testing.T) {
 	var typed *Error
 	if !errors.As(err, &typed) || typed.Provider != "empty" {
 		t.Fatalf("provider failure = %#v, want provider empty", typed)
+	}
+}
+
+func TestTranslateNormalizesUntypedProviderErrorWithoutExposingCause(t *testing.T) {
+	secret := errors.New("request=Hello raw-response=secret-token")
+	provider := &fakeProvider{
+		name: "unsafe",
+		translateFn: func(context.Context, Request) (ProviderResult, error) {
+			return ProviderResult{}, secret
+		},
+	}
+	client, err := New(WithProviders(provider))
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	_, err = client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr", Provider: "unsafe"})
+	var typed *Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("Translate error type = %T, want *Error", err)
+	}
+	if typed.Kind != ErrorProviderFailure || typed.Provider != "unsafe" || !typed.Retryable {
+		t.Fatalf("normalized provider error = %#v", typed)
+	}
+	if !errors.Is(err, secret) {
+		t.Fatal("normalized provider error did not retain its cause")
+	}
+	if message := err.Error(); strings.Contains(message, "Hello") || strings.Contains(message, "secret-token") || strings.Contains(message, "raw-response") {
+		t.Fatalf("normalized provider error exposed cause content: %q", message)
+	}
+}
+
+func TestTranslateNormalizesWrappedTypedProviderErrorWithoutExposingWrapper(t *testing.T) {
+	secret := errors.New("credential=secret-token")
+	providerError := NewProviderError(ErrorRateLimited, "", 429, true, secret)
+	wrapper := fmt.Errorf("raw-response=private-body: %w", providerError)
+	provider := &fakeProvider{
+		name: "typed",
+		translateFn: func(context.Context, Request) (ProviderResult, error) {
+			return ProviderResult{}, wrapper
+		},
+	}
+	client, err := New(WithProviders(provider))
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+
+	_, err = client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr", Provider: "typed"})
+	var typed *Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("Translate error type = %T, want *Error", err)
+	}
+	if typed == providerError {
+		t.Fatal("Translate returned the provider's typed error without a privacy boundary")
+	}
+	if typed.Kind != ErrorRateLimited || typed.Provider != "typed" || typed.StatusCode != 429 || !typed.Retryable {
+		t.Fatalf("normalized typed error = %#v", typed)
+	}
+	if !errors.Is(err, wrapper) || !errors.Is(err, providerError) || !errors.Is(err, secret) {
+		t.Fatal("normalized typed error did not retain its wrapped causes")
+	}
+	if message := err.Error(); strings.Contains(message, "private-body") || strings.Contains(message, "secret-token") || strings.Contains(message, "raw-response") {
+		t.Fatalf("normalized typed error exposed cause content: %q", message)
 	}
 }
 

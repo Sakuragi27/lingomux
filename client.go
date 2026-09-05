@@ -2,6 +2,7 @@ package lingomux
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"time"
 )
@@ -76,26 +77,30 @@ func (client *Client) Translate(ctx context.Context, request Request) (Result, e
 	if ctx == nil {
 		return Result{}, invalidRequestError()
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, timeoutError(normalized.Provider, err)
+	}
+
+	totalCtx, cancel := context.WithTimeout(ctx, client.timeout)
+	defer cancel()
 
 	provider, exists := client.providerByName[normalized.Provider]
 	if !exists {
 		return Result{}, &Error{Kind: ErrorUnknownProvider, Provider: normalized.Provider}
 	}
-	if !provider.Supports(normalized.SourceLanguage, normalized.TargetLanguage) {
-		return Result{}, &Error{Kind: ErrorUnsupportedLanguage, Provider: normalized.Provider}
-	}
-
-	totalCtx, cancel := context.WithTimeout(ctx, client.timeout)
-	defer cancel()
+	supported := provider.Supports(normalized.SourceLanguage, normalized.TargetLanguage)
 	if err := totalCtx.Err(); err != nil {
-		return Result{}, err
+		return Result{}, timeoutError(normalized.Provider, err)
+	}
+	if !supported {
+		return Result{}, &Error{Kind: ErrorUnsupportedLanguage, Provider: normalized.Provider}
 	}
 
 	started := time.Now()
 	providerResult, err := provider.Translate(totalCtx, normalized)
 	duration := time.Since(started)
 	if err != nil {
-		return Result{}, err
+		return Result{}, normalizeProviderError(err, normalized.Provider)
 	}
 	if providerResult.Text == "" {
 		return Result{}, &Error{
@@ -119,6 +124,38 @@ func (client *Client) Translate(ctx context.Context, request Request) (Result, e
 		Provider:       normalized.Provider,
 		Duration:       duration,
 	}, nil
+}
+
+func timeoutError(provider string, cause error) *Error {
+	return &Error{
+		Kind:      ErrorTimeout,
+		Provider:  provider,
+		Retryable: true,
+		Cause:     cause,
+	}
+}
+
+func normalizeProviderError(err error, provider string) *Error {
+	var typed *Error
+	if errors.As(err, &typed) && typed != nil {
+		providerName := typed.Provider
+		if providerName == "" {
+			providerName = provider
+		}
+		return &Error{
+			Kind:       typed.Kind,
+			Provider:   providerName,
+			StatusCode: typed.StatusCode,
+			Retryable:  typed.Retryable,
+			Cause:      err,
+		}
+	}
+	return &Error{
+		Kind:      ErrorProviderFailure,
+		Provider:  provider,
+		Retryable: true,
+		Cause:     err,
+	}
 }
 
 func isNilProvider(provider Provider) bool {
