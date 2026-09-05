@@ -119,6 +119,10 @@ func (provider *Provider) Translate(ctx context.Context, request lingomux.Reques
 				lingomux.ErrorTimeout, providerName, response.StatusCode, true, cause,
 			)
 		}
+		if response.StatusCode != 0 &&
+			(response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices) {
+			return lingomux.ProviderResult{}, mapHTTPError(response.StatusCode)
+		}
 		if response.StatusCode != 0 {
 			return lingomux.ProviderResult{}, lingomux.NewProviderError(
 				lingomux.ErrorProviderFailure, providerName, response.StatusCode, true, err,

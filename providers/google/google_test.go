@@ -194,6 +194,102 @@ func TestTranslateMapsHTTPFailures(t *testing.T) {
 	}
 }
 
+func TestTranslatePrioritizesHTTPStatusOverResponseBodyFailures(t *testing.T) {
+	readFailure := errors.New("response-reader-secret")
+	tests := []struct {
+		name      string
+		status    int
+		body      func() io.ReadCloser
+		kind      lingomux.ErrorKind
+		retryable bool
+	}{
+		{
+			name:      "400 with oversized body",
+			status:    http.StatusBadRequest,
+			body:      oversizedResponseBody,
+			kind:      lingomux.ErrorInvalidRequest,
+			retryable: false,
+		},
+		{
+			name:      "401 with failing body reader",
+			status:    http.StatusUnauthorized,
+			body:      func() io.ReadCloser { return &failingReadCloser{err: readFailure} },
+			kind:      lingomux.ErrorAuthentication,
+			retryable: false,
+		},
+		{
+			name:      "403 with oversized body",
+			status:    http.StatusForbidden,
+			body:      oversizedResponseBody,
+			kind:      lingomux.ErrorAuthentication,
+			retryable: false,
+		},
+		{
+			name:      "429 with failing body reader",
+			status:    http.StatusTooManyRequests,
+			body:      func() io.ReadCloser { return &failingReadCloser{err: readFailure} },
+			kind:      lingomux.ErrorRateLimited,
+			retryable: true,
+		},
+		{
+			name:      "500 with oversized body",
+			status:    http.StatusInternalServerError,
+			body:      oversizedResponseBody,
+			kind:      lingomux.ErrorUnavailable,
+			retryable: true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider, err := New(Config{
+				APIKey:  "api-secret",
+				BaseURL: "https://google.test",
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: test.status,
+						Header:     make(http.Header),
+						Body:       test.body(),
+					}, nil
+				})},
+			})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			_, err = provider.Translate(context.Background(), validRequest())
+			assertProviderError(t, err, test.kind, test.status, test.retryable)
+			for _, secret := range []string{"api-secret", "source-secret", "response-reader-secret", "oversized-response-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("error leaked %q: %q", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTranslatePrioritizesContextFailureOverHTTPStatus(t *testing.T) {
+	provider, err := New(Config{
+		APIKey:  "key",
+		BaseURL: "https://google.test",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnauthorized,
+				Header:     make(http.Header),
+				Body:       &failingReadCloser{err: context.Canceled},
+			}, nil
+		})},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = provider.Translate(context.Background(), validRequest())
+	assertProviderError(t, err, lingomux.ErrorTimeout, http.StatusUnauthorized, true)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error does not retain context cancellation: %v", err)
+	}
+}
+
 func TestTranslateRejectsMalformedAndEmptySuccessResponses(t *testing.T) {
 	tests := []struct {
 		name string
@@ -278,4 +374,20 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+type failingReadCloser struct {
+	err error
+}
+
+func (body *failingReadCloser) Read([]byte) (int, error) {
+	return 0, body.err
+}
+
+func (*failingReadCloser) Close() error {
+	return nil
+}
+
+func oversizedResponseBody() io.ReadCloser {
+	return io.NopCloser(strings.NewReader(strings.Repeat("oversized-response-secret", 1+(1<<20)/len("oversized-response-secret"))))
 }

@@ -74,11 +74,14 @@ func Do(ctx context.Context, client *http.Client, method, endpoint string, paylo
 
 	bounded, err := io.ReadAll(io.LimitReader(httpResponse.Body, MaxResponseBytes+1))
 	response := Response{StatusCode: httpResponse.StatusCode, Body: bounded}
+	tooLarge := len(bounded) > MaxResponseBytes
+	if tooLarge {
+		response.Body = bounded[:MaxResponseBytes]
+	}
 	if err != nil {
 		return response, err
 	}
-	if len(bounded) > MaxResponseBytes {
-		response.Body = bounded[:MaxResponseBytes]
+	if tooLarge {
 		return response, ErrResponseTooLarge
 	}
 	return response, nil

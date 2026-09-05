@@ -91,6 +91,29 @@ func TestDoRejectsResponsesOverOneMiBAndBoundsReads(t *testing.T) {
 	}
 }
 
+func TestDoClampsResponseBodyWhenReaderReturnsDataAndErrorAtLimit(t *testing.T) {
+	readFailure := errors.New("body read failed")
+	body := &dataErrorReadCloser{remaining: MaxResponseBytes + 1, finalError: readFailure}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+		}, nil
+	})}
+
+	response, err := Do(context.Background(), client, http.MethodPost, "https://example.test/translate", struct{}{})
+	if !errors.Is(err, readFailure) {
+		t.Fatalf("Do() error = %v, want body read failure", err)
+	}
+	if len(response.Body) != MaxResponseBytes {
+		t.Errorf("body length = %d, want %d", len(response.Body), MaxResponseBytes)
+	}
+	if !body.closed.Load() {
+		t.Error("response body was not closed")
+	}
+}
+
 func TestDoHonorsContextCancellation(t *testing.T) {
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		<-request.Context().Done()
@@ -165,6 +188,35 @@ func (body *countingReadCloser) Read(buffer []byte) (int, error) {
 }
 
 func (body *countingReadCloser) Close() error {
+	body.closed.Store(true)
+	return nil
+}
+
+type dataErrorReadCloser struct {
+	remaining  int
+	finalError error
+	closed     atomic.Bool
+}
+
+func (body *dataErrorReadCloser) Read(buffer []byte) (int, error) {
+	if body.remaining == 0 {
+		return 0, body.finalError
+	}
+	read := len(buffer)
+	if read > body.remaining {
+		read = body.remaining
+	}
+	for index := 0; index < read; index++ {
+		buffer[index] = 'x'
+	}
+	body.remaining -= read
+	if body.remaining == 0 {
+		return read, body.finalError
+	}
+	return read, nil
+}
+
+func (body *dataErrorReadCloser) Close() error {
 	body.closed.Store(true)
 	return nil
 }
