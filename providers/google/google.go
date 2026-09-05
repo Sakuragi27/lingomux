@@ -60,7 +60,11 @@ func New(config Config) (*Provider, error) {
 	if client == nil {
 		client = httpjson.NewClient()
 	}
-	return &Provider{apiKey: config.APIKey, baseURL: parsed, httpClient: client}, nil
+	providerClient := *client
+	providerClient.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	return &Provider{apiKey: config.APIKey, baseURL: parsed, httpClient: &providerClient}, nil
 }
 
 // Name returns the stable provider identifier.
