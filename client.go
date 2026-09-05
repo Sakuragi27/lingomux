@@ -68,7 +68,7 @@ func New(options ...Option) (*Client, error) {
 	}, nil
 }
 
-// Translate validates request and routes an explicitly selected provider.
+// Translate validates request and routes it explicitly or by serial automatic fallback.
 func (client *Client) Translate(ctx context.Context, request Request) (Result, error) {
 	normalized, err := normalizeRequest(request, client.maxTextRunes)
 	if err != nil {
@@ -83,6 +83,9 @@ func (client *Client) Translate(ctx context.Context, request Request) (Result, e
 
 	totalCtx, cancel := context.WithTimeout(ctx, client.timeout)
 	defer cancel()
+	if normalized.Provider == AutoProvider {
+		return client.translateAuto(totalCtx, normalized)
+	}
 
 	provider, exists := client.providerByName[normalized.Provider]
 	if !exists {
@@ -96,18 +99,90 @@ func (client *Client) Translate(ctx context.Context, request Request) (Result, e
 		return Result{}, &Error{Kind: ErrorUnsupportedLanguage, Provider: normalized.Provider}
 	}
 
-	started := time.Now()
-	providerResult, err := provider.Translate(totalCtx, normalized)
-	duration := time.Since(started)
-	if err != nil {
-		return Result{}, normalizeProviderError(err, normalized.Provider)
+	result, _, err := client.translateAttempt(totalCtx, provider, normalized, 0)
+	return result, err
+}
+
+func (client *Client) translateAuto(ctx context.Context, request Request) (Result, error) {
+	eligible := make([]registeredProvider, 0, len(client.providers))
+	for _, provider := range client.providers {
+		if err := ctx.Err(); err != nil {
+			return Result{}, timeoutError(AutoProvider, err)
+		}
+		supported := provider.provider.Supports(request.SourceLanguage, request.TargetLanguage)
+		if err := ctx.Err(); err != nil {
+			return Result{}, timeoutError(AutoProvider, err)
+		}
+		if supported {
+			eligible = append(eligible, provider)
+		}
 	}
-	if providerResult.Text == "" {
-		return Result{}, &Error{
+	if len(eligible) == 0 {
+		return Result{}, &Error{Kind: ErrorUnsupportedLanguage, Provider: AutoProvider}
+	}
+
+	failures := make([]ProviderFailure, 0, len(eligible))
+	for index, provider := range eligible {
+		if err := ctx.Err(); err != nil {
+			return Result{}, timeoutError(AutoProvider, err)
+		}
+		var attemptTimeout time.Duration
+		if index < len(eligible)-1 {
+			attemptTimeout = client.attemptTimeout
+		}
+		request.Provider = provider.name
+		result, attempted, err := client.translateAttempt(ctx, provider.provider, request, attemptTimeout)
+		if err == nil {
+			return result, nil
+		}
+		typed := err.(*Error)
+		if !typed.Retryable {
+			return Result{}, typed
+		}
+		if attempted {
+			failures = append(failures, ProviderFailure{Provider: provider.name, Error: typed})
+		} else if ctx.Err() != nil {
+			return Result{}, typed
+		}
+	}
+	return Result{}, &AggregateError{Failures: failures}
+}
+
+// translateAttempt reports whether Translate was called, so preflight timeouts
+// never appear as completed attempts in hooks or aggregated failures.
+func (client *Client) translateAttempt(ctx context.Context, provider Provider, request Request, timeout time.Duration) (Result, bool, error) {
+	var attemptCtx context.Context
+	var cancel context.CancelFunc
+	if timeout > 0 {
+		attemptCtx, cancel = context.WithTimeout(ctx, timeout)
+	} else {
+		attemptCtx, cancel = context.WithCancel(ctx)
+	}
+	if err := attemptCtx.Err(); err != nil {
+		cancel()
+		return Result{}, false, timeoutError(request.Provider, err)
+	}
+	started := time.Now()
+	providerResult, err := provider.Translate(attemptCtx, request)
+	duration := time.Since(started)
+	cancel()
+	var failure *Error
+	if err != nil {
+		failure = normalizeProviderError(err, request.Provider)
+	} else if providerResult.Text == "" {
+		failure = &Error{
 			Kind:      ErrorProviderFailure,
-			Provider:  normalized.Provider,
+			Provider:  request.Provider,
 			Retryable: true,
 		}
+	}
+	attempt := Attempt{Provider: request.Provider, Duration: duration, Success: failure == nil}
+	if failure != nil {
+		attempt.ErrorKind = failure.Kind
+	}
+	client.attemptHook.invoke(attempt)
+	if failure != nil {
+		return Result{}, true, failure
 	}
 
 	sourceLanguage := UndeterminedLanguage
@@ -120,10 +195,10 @@ func (client *Client) Translate(ctx context.Context, request Request) (Result, e
 	return Result{
 		Text:           providerResult.Text,
 		SourceLanguage: sourceLanguage,
-		TargetLanguage: normalized.TargetLanguage,
-		Provider:       normalized.Provider,
+		TargetLanguage: request.TargetLanguage,
+		Provider:       request.Provider,
 		Duration:       duration,
-	}, nil
+	}, true, nil
 }
 
 func timeoutError(provider string, cause error) *Error {
@@ -136,6 +211,9 @@ func timeoutError(provider string, cause error) *Error {
 }
 
 func normalizeProviderError(err error, provider string) *Error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return timeoutError(provider, err)
+	}
 	var typed *Error
 	if errors.As(err, &typed) && typed != nil {
 		providerName := typed.Provider

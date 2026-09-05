@@ -1,10 +1,49 @@
 package lingomux
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestNormalizeProviderContextErrorsPreservesCauseWithoutPayload(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			wrapped := fmt.Errorf("request=private-input credential=private-key raw-body=private-body: %w", cause)
+			err := normalizeProviderError(wrapped, "provider")
+			if err.Kind != ErrorTimeout || err.Provider != "provider" || !err.Retryable {
+				t.Fatalf("normalized error=%#v", err)
+			}
+			if !errors.Is(err, wrapped) || !errors.Is(err, cause) {
+				t.Fatal("normalization lost context cause")
+			}
+			if strings.Contains(err.Error(), "private-") {
+				t.Fatalf("error exposed payload: %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeContextCauseTakesPrecedenceOverContradictoryTypedError(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			providerError := NewProviderError(ErrorAuthentication, "provider", 401, false, cause)
+			wrapped := fmt.Errorf("private response: %w", providerError)
+			err := normalizeProviderError(wrapped, "provider")
+			if err.Kind != ErrorTimeout || !err.Retryable {
+				t.Fatalf("context normalization=%#v", err)
+			}
+			if !errors.Is(err, cause) || !errors.Is(err, providerError) || !errors.Is(err, wrapped) {
+				t.Fatal("lost context or typed cause")
+			}
+			if strings.Contains(err.Error(), "private response") {
+				t.Fatalf("exposed wrapper: %v", err)
+			}
+		})
+	}
+}
 
 func TestProviderErrorPreservesCauseForInspectionWithoutExposingIt(t *testing.T) {
 	secret := errors.New("authorization: Bearer secret-token and request body")

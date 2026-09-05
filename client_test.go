@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -234,7 +235,7 @@ func TestTranslateExplicitReceivesTotalRemainingDeadline(t *testing.T) {
 	}
 	client, err := New(
 		WithProviders(provider),
-		WithTimeout(2*time.Second),
+		WithTimeout(10*time.Second),
 		WithAttemptTimeout(20*time.Millisecond),
 	)
 	if err != nil {
@@ -245,8 +246,8 @@ func TestTranslateExplicitReceivesTotalRemainingDeadline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Translate returned error: %v", err)
 	}
-	if remaining < time.Second || remaining > 2100*time.Millisecond {
-		t.Fatalf("provider deadline remaining = %v, want approximately 2s", remaining)
+	if remaining < 8*time.Second || remaining > 10*time.Second {
+		t.Fatalf("provider deadline remaining = %v, want approximately 10s", remaining)
 	}
 }
 
@@ -470,5 +471,415 @@ func assertErrorKind(t *testing.T, err error, want ErrorKind) {
 	}
 	if !IsKind(err, want) {
 		t.Fatalf("error = %v, want kind %q", err, want)
+	}
+}
+
+func TestTranslateAutoUsesSerialRegistrationOrderAndSkipsUnsupported(t *testing.T) {
+	var events []string
+	var active atomic.Int64
+	makeProvider := func(name string, supported, succeeds bool) *fakeProvider {
+		return &fakeProvider{name: name, supportsFn: func(source, target string) bool {
+			if source != "en-US" || target != "fr" {
+				t.Errorf("Supports languages = %q, %q", source, target)
+			}
+			events = append(events, "supports:"+name)
+			return supported
+		}, translateFn: func(_ context.Context, request Request) (ProviderResult, error) {
+			if active.Add(1) != 1 {
+				t.Error("provider attempts overlapped")
+			}
+			defer active.Add(-1)
+			if request.Provider != name || request.Text != "Hello" {
+				t.Errorf("attempt request = %#v", request)
+			}
+			events = append(events, "translate:"+name)
+			if succeeds {
+				return ProviderResult{Text: "bonjour", SourceLanguage: "EN-us"}, nil
+			}
+			return ProviderResult{}, NewProviderError(ErrorUnavailable, "", 503, true, nil)
+		}}
+	}
+	client := newTestClient(t, WithProviders(makeProvider("first", true, false), makeProvider("skip", false, false), makeProvider("second", true, true), makeProvider("unused", true, true)))
+	result, err := client.Translate(context.Background(), Request{Text: "Hello", SourceLanguage: "EN-us", TargetLanguage: "FR"})
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+	want := []string{"supports:first", "supports:skip", "supports:second", "supports:unused", "translate:first", "translate:second"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
+	}
+	if result.Text != "bonjour" || result.Provider != "second" || result.SourceLanguage != "en-US" || result.TargetLanguage != "fr" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestTranslateAutoFallsBackOnlyForRetryableErrors(t *testing.T) {
+	for _, kind := range []ErrorKind{ErrorRateLimited, ErrorTimeout, ErrorUnavailable, ErrorProviderFailure, ErrorInvalidRequest, ErrorAuthentication, ErrorUnsupportedLanguage, ErrorUnknownProvider} {
+		for _, retryable := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/retryable=%t", kind, retryable), func(t *testing.T) {
+				cause := errors.New("private provider body")
+				first := &fakeProvider{name: "first", translateFn: func(context.Context, Request) (ProviderResult, error) {
+					return ProviderResult{}, fmt.Errorf("private wrapper: %w", NewProviderError(kind, "", 503, retryable, cause))
+				}}
+				second := &fakeProvider{name: "second"}
+				client := newTestClient(t, WithProviders(first, second))
+				result, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+				if retryable {
+					if err != nil || result.Provider != "second" || second.calls.Load() != 1 {
+						t.Fatalf("fallback result=%#v err=%v calls=%d", result, err, second.calls.Load())
+					}
+				} else {
+					assertErrorKind(t, err, kind)
+					if _, ok := err.(*Error); !ok || !errors.Is(err, cause) || second.calls.Load() != 0 {
+						t.Fatalf("stop error=%v calls=%d", err, second.calls.Load())
+					}
+				}
+				if first.calls.Load() != 1 {
+					t.Fatalf("first calls = %d", first.calls.Load())
+				}
+			})
+		}
+	}
+}
+
+func TestTranslateAutoAggregatesOnlyAttemptedFailuresInOrder(t *testing.T) {
+	secret := errors.New("request=private-input credential=private-key raw-body=private-output")
+	first := &fakeProvider{name: "first", translateFn: func(context.Context, Request) (ProviderResult, error) { return ProviderResult{}, secret }}
+	skip := &fakeProvider{name: "skip", supportsFn: func(string, string) bool { return false }}
+	last := &fakeProvider{name: "last", translateFn: func(context.Context, Request) (ProviderResult, error) { return ProviderResult{}, nil }}
+	client := newTestClient(t, WithProviders(first, skip, last))
+	_, err := client.Translate(context.Background(), Request{Text: "private-input", TargetLanguage: "fr"})
+	aggregate, ok := err.(*AggregateError)
+	if !ok {
+		t.Fatalf("error = %T (%v), want *AggregateError", err, err)
+	}
+	if len(aggregate.Failures) != 2 || aggregate.Failures[0].Provider != "first" || aggregate.Failures[1].Provider != "last" {
+		t.Fatalf("failures = %#v", aggregate.Failures)
+	}
+	for _, failure := range aggregate.Failures {
+		typed, ok := failure.Error.(*Error)
+		if !ok || typed.Kind != ErrorProviderFailure || !typed.Retryable || typed.Provider != failure.Provider {
+			t.Fatalf("failure = %#v", failure)
+		}
+	}
+	if !errors.Is(err, secret) {
+		t.Fatal("aggregate lost provider cause")
+	}
+	if strings.Contains(err.Error(), "private-") {
+		t.Fatalf("aggregate exposed payload: %v", err)
+	}
+	if skip.calls.Load() != 0 {
+		t.Fatal("unsupported provider was attempted")
+	}
+}
+
+func TestTranslateAutoWithNoEligibleProvider(t *testing.T) {
+	provider := &fakeProvider{name: "skip", supportsFn: func(string, string) bool { return false }}
+	client := newTestClient(t, WithProviders(provider))
+	_, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+	assertErrorKind(t, err, ErrorUnsupportedLanguage)
+	if provider.calls.Load() != 0 {
+		t.Fatal("unsupported provider was attempted")
+	}
+}
+
+func newTestClient(t *testing.T, options ...Option) *Client {
+	t.Helper()
+	client, err := New(options...)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return client
+}
+
+func TestTranslateAutoAssignsAttemptDeadlines(t *testing.T) {
+	for _, tt := range []struct {
+		name                                        string
+		total, attempt, firstMin, firstMax, lastMin time.Duration
+	}{
+		{"default cap", 10 * time.Second, 0, 2 * time.Second, 3 * time.Second, 8 * time.Second},
+		{"configured cap", 10 * time.Second, 2 * time.Second, time.Second, 2 * time.Second, 8 * time.Second},
+		{"total shorter than cap", 2 * time.Second, 3 * time.Second, time.Second, 2 * time.Second, time.Second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var firstCtx, lastCtx context.Context
+			var firstRemaining, lastRemaining time.Duration
+			first := &fakeProvider{name: "first", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+				firstCtx = ctx
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					t.Error("first context has no deadline")
+				}
+				firstRemaining = time.Until(deadline)
+				return ProviderResult{}, errors.New("transport failure")
+			}}
+			last := &fakeProvider{name: "last", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+				if firstCtx.Err() != context.Canceled {
+					t.Errorf("first context not canceled before next attempt: %v", firstCtx.Err())
+				}
+				lastCtx = ctx
+				deadline, ok := ctx.Deadline()
+				if !ok {
+					t.Error("last context has no deadline")
+				}
+				lastRemaining = time.Until(deadline)
+				return ProviderResult{Text: "translated"}, nil
+			}}
+			skip := &fakeProvider{name: "trailing-skip", supportsFn: func(string, string) bool { return false }}
+			options := []Option{WithProviders(first, last, skip), WithTimeout(tt.total)}
+			if tt.attempt > 0 {
+				options = append(options, WithAttemptTimeout(tt.attempt))
+			}
+			client := newTestClient(t, options...)
+			_, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+			if err != nil {
+				t.Fatalf("Translate: %v", err)
+			}
+			if firstRemaining < tt.firstMin || firstRemaining > tt.firstMax {
+				t.Fatalf("first remaining = %v, want [%v,%v]", firstRemaining, tt.firstMin, tt.firstMax)
+			}
+			if lastRemaining < tt.lastMin || lastRemaining > tt.total {
+				t.Fatalf("last remaining = %v, want [%v,%v]", lastRemaining, tt.lastMin, tt.total)
+			}
+			if lastCtx.Err() != context.Canceled {
+				t.Fatalf("last attempt context not canceled: %v", lastCtx.Err())
+			}
+		})
+	}
+}
+
+func TestTranslateAutoStopsWhenContextExpiresDuringEligibility(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var supportCalls int
+	first := &fakeProvider{name: "first", supportsFn: func(string, string) bool { cancel(); return true }}
+	second := &fakeProvider{name: "second", supportsFn: func(string, string) bool { supportCalls++; return true }}
+	client := newTestClient(t, WithProviders(first, second))
+	_, err := client.Translate(ctx, Request{Text: "Hello", TargetLanguage: "fr"})
+	assertErrorKind(t, err, ErrorTimeout)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatal("timeout lost cancellation cause")
+	}
+	if first.calls.Load() != 0 || second.calls.Load() != 0 || supportCalls != 0 {
+		t.Fatal("router continued after eligibility cancellation")
+	}
+}
+
+func TestTranslateAutoStopsWhenTotalDeadlineExpiresDuringAttempt(t *testing.T) {
+	first := &fakeProvider{name: "first", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+		<-ctx.Done()
+		return ProviderResult{}, ctx.Err()
+	}}
+	second := &fakeProvider{name: "second"}
+	client := newTestClient(t, WithProviders(first, second), WithTimeout(30*time.Millisecond), WithAttemptTimeout(time.Second))
+	_, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+	assertErrorKind(t, err, ErrorTimeout)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("timeout lost deadline cause")
+	}
+	if first.calls.Load() != 1 || second.calls.Load() != 0 {
+		t.Fatalf("calls=(%d,%d), want (1,0)", first.calls.Load(), second.calls.Load())
+	}
+}
+
+func TestAttemptHookReportsCompletedAttemptsWithoutPayload(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		t.Run(fmt.Sprintf("explicit=%t", explicit), func(t *testing.T) {
+			var attempts []Attempt
+			var attemptCtx context.Context
+			first := &fakeProvider{name: "first", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+				attemptCtx = ctx
+				return ProviderResult{}, errors.New("secret-input secret-key secret-body")
+			}}
+			skip := &fakeProvider{name: "skip", supportsFn: func(string, string) bool { return false }}
+			last := &fakeProvider{name: "last", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+				if len(attempts) != 1 {
+					t.Error("first hook had not completed before next attempt")
+				}
+				attemptCtx = ctx
+				return ProviderResult{Text: "secret-output"}, nil
+			}}
+			client := newTestClient(t, WithProviders(first, skip, last), WithAttemptHook(func(attempt Attempt) {
+				if attemptCtx.Err() != context.Canceled {
+					t.Errorf("attempt context still active during hook: %v", attemptCtx.Err())
+				}
+				attempts = append(attempts, attempt)
+			}))
+			request := Request{Text: "secret-input", TargetLanguage: "fr"}
+			if explicit {
+				request.Provider = "first"
+			}
+			result, err := client.Translate(context.Background(), request)
+			wantCount := 2
+			if explicit {
+				wantCount = 1
+				assertErrorKind(t, err, ErrorProviderFailure)
+			} else if err != nil {
+				t.Fatalf("Translate: %v", err)
+			}
+			if len(attempts) != wantCount {
+				t.Fatalf("hook calls=%d, want %d", len(attempts), wantCount)
+			}
+			if attempts[0].Provider != "first" || attempts[0].Success || attempts[0].ErrorKind != ErrorProviderFailure || attempts[0].Duration < 0 {
+				t.Fatalf("first attempt=%#v", attempts[0])
+			}
+			if !explicit && (attempts[1].Provider != "last" || !attempts[1].Success || attempts[1].ErrorKind != "" || attempts[1].Duration != result.Duration) {
+				t.Fatalf("last attempt=%#v result=%#v", attempts[1], result)
+			}
+			if strings.Contains(fmt.Sprintf("%+v", attempts), "secret-") {
+				t.Fatal("hook exposed payload")
+			}
+		})
+	}
+}
+
+func TestAttemptHookBlocksTranslationUntilItCompletes(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseHook := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseHook()
+	client := newTestClient(t, WithProviders(&fakeProvider{name: "provider"}), WithAttemptHook(func(Attempt) { close(entered); <-release }))
+	done := make(chan error, 1)
+	go func() {
+		_, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr", Provider: "provider"})
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case err := <-done:
+		t.Fatalf("Translate returned before hook entered: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("hook did not start")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Translate returned while hook blocked: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseHook()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Translate after hook: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Translate did not finish after hook")
+	}
+}
+
+func TestAttemptHookPanicDoesNotBreakFallbackOrSuccess(t *testing.T) {
+	var count int
+	first := &fakeProvider{name: "first", translateFn: func(context.Context, Request) (ProviderResult, error) {
+		return ProviderResult{}, errors.New("transport failure")
+	}}
+	last := &fakeProvider{name: "last"}
+	client := newTestClient(t, WithProviders(first, last), WithAttemptHook(func(Attempt) { count++; panic("secret hook body") }))
+	result, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+	if err != nil || result.Provider != "last" || count != 2 {
+		t.Fatalf("result=%#v err=%v hook calls=%d", result, err, count)
+	}
+}
+
+func TestAttemptHookIsNotCalledBeforeAProviderAttempt(t *testing.T) {
+	var count int
+	client := newTestClient(t, WithProviders(&fakeProvider{name: "skip", supportsFn: func(string, string) bool { return false }}), WithAttemptHook(func(Attempt) { count++ }))
+	for _, request := range []Request{{Text: "", TargetLanguage: "fr"}, {Text: "Hello", TargetLanguage: "fr", Provider: "missing"}, {Text: "Hello", TargetLanguage: "fr"}, {Text: "Hello", TargetLanguage: "fr", Provider: "skip"}} {
+		_, err := client.Translate(context.Background(), request)
+		if err == nil {
+			t.Fatal("expected routing or validation error")
+		}
+	}
+	if count != 0 {
+		t.Fatalf("hook calls=%d, want 0", count)
+	}
+}
+
+func TestTranslateAutoFallsBackAfterAttemptDeadline(t *testing.T) {
+	var attempts []Attempt
+	first := &fakeProvider{name: "first", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+		<-ctx.Done()
+		return ProviderResult{}, fmt.Errorf("private body: %w", ctx.Err())
+	}}
+	last := &fakeProvider{name: "last"}
+	client := newTestClient(t, WithProviders(first, last), WithTimeout(5*time.Second), WithAttemptTimeout(20*time.Millisecond), WithAttemptHook(func(attempt Attempt) { attempts = append(attempts, attempt) }))
+	result, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+	if err != nil || result.Provider != "last" {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if len(attempts) != 2 || attempts[0].ErrorKind != ErrorTimeout {
+		t.Fatalf("attempts=%#v", attempts)
+	}
+}
+
+func TestTranslateAutoHonorsCallerDeadlineForOnlyEligibleProvider(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	wantDeadline, _ := ctx.Deadline()
+	provider := &fakeProvider{name: "only", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || !deadline.Equal(wantDeadline) {
+			t.Errorf("deadline=%v, want caller deadline %v", deadline, wantDeadline)
+		}
+		return ProviderResult{Text: "translated"}, nil
+	}}
+	skip := &fakeProvider{name: "skip", supportsFn: func(string, string) bool { return false }}
+	client := newTestClient(t, WithProviders(provider, skip), WithTimeout(time.Hour), WithAttemptTimeout(time.Second))
+	_, err := client.Translate(ctx, Request{Text: "Hello", TargetLanguage: "fr"})
+	if err != nil {
+		t.Fatalf("Translate: %v", err)
+	}
+}
+
+func TestTranslateAutoStopsWhenHookCancelsTotalContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var hookCalls int
+	first := &fakeProvider{name: "first", translateFn: func(context.Context, Request) (ProviderResult, error) {
+		return ProviderResult{}, errors.New("transport failure")
+	}}
+	last := &fakeProvider{name: "last"}
+	client := newTestClient(t, WithProviders(first, last), WithAttemptHook(func(Attempt) { hookCalls++; cancel() }))
+	_, err := client.Translate(ctx, Request{Text: "Hello", TargetLanguage: "fr"})
+	assertErrorKind(t, err, ErrorTimeout)
+	if !errors.Is(err, context.Canceled) || last.calls.Load() != 0 || hookCalls != 1 {
+		t.Fatalf("error=%v last calls=%d hooks=%d", err, last.calls.Load(), hookCalls)
+	}
+}
+
+func TestTranslateAutoFinalContextFailureIsAggregated(t *testing.T) {
+	first := &fakeProvider{name: "first", translateFn: func(context.Context, Request) (ProviderResult, error) {
+		return ProviderResult{}, errors.New("transport failure")
+	}}
+	last := &fakeProvider{name: "last", translateFn: func(ctx context.Context, _ Request) (ProviderResult, error) {
+		<-ctx.Done()
+		return ProviderResult{}, ctx.Err()
+	}}
+	client := newTestClient(t, WithProviders(first, last), WithTimeout(30*time.Millisecond))
+	_, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+	aggregate, ok := err.(*AggregateError)
+	if !ok || len(aggregate.Failures) != 2 {
+		t.Fatalf("error=%T %v, want two aggregated failures", err, err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal("aggregate lost final deadline cause")
+	}
+	assertErrorKind(t, aggregate.Failures[1].Error, ErrorTimeout)
+}
+
+func TestTranslateAutoDoesNotAggregateAttemptsThatNeverStarted(t *testing.T) {
+	first := &fakeProvider{name: "first", translateFn: func(context.Context, Request) (ProviderResult, error) {
+		return ProviderResult{}, errors.New("first failed")
+	}}
+	last := &fakeProvider{name: "last", translateFn: func(context.Context, Request) (ProviderResult, error) {
+		return ProviderResult{}, errors.New("last failed")
+	}}
+	client := newTestClient(t, WithProviders(first, last), WithAttemptTimeout(time.Nanosecond))
+	_, err := client.Translate(context.Background(), Request{Text: "Hello", TargetLanguage: "fr"})
+	aggregate, ok := err.(*AggregateError)
+	if !ok {
+		t.Fatalf("error=%T %v, want aggregate", err, err)
+	}
+	if got, want := len(aggregate.Failures), int(first.calls.Load()+last.calls.Load()); got != want {
+		t.Fatalf("aggregate contains %d failures for %d actual provider calls", got, want)
 	}
 }
