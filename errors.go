@@ -10,14 +10,22 @@ import (
 type ErrorKind string
 
 const (
-	ErrorInvalidRequest      ErrorKind = "invalid_request"
-	ErrorUnknownProvider     ErrorKind = "unknown_provider"
+	// ErrorInvalidRequest indicates invalid request data or configuration.
+	ErrorInvalidRequest ErrorKind = "invalid_request"
+	// ErrorUnknownProvider indicates that the requested provider is not registered.
+	ErrorUnknownProvider ErrorKind = "unknown_provider"
+	// ErrorUnsupportedLanguage indicates an unsupported source or target language.
 	ErrorUnsupportedLanguage ErrorKind = "unsupported_language"
-	ErrorAuthentication      ErrorKind = "authentication"
-	ErrorRateLimited         ErrorKind = "rate_limited"
-	ErrorTimeout             ErrorKind = "timeout"
-	ErrorUnavailable         ErrorKind = "unavailable"
-	ErrorProviderFailure     ErrorKind = "provider_failure"
+	// ErrorAuthentication indicates rejected provider credentials or permissions.
+	ErrorAuthentication ErrorKind = "authentication"
+	// ErrorRateLimited indicates that a provider throttled the request.
+	ErrorRateLimited ErrorKind = "rate_limited"
+	// ErrorTimeout indicates cancellation or an exceeded deadline.
+	ErrorTimeout ErrorKind = "timeout"
+	// ErrorUnavailable indicates an unavailable provider or transport.
+	ErrorUnavailable ErrorKind = "unavailable"
+	// ErrorProviderFailure indicates a provider failure without a more specific kind.
+	ErrorProviderFailure ErrorKind = "provider_failure"
 )
 
 // Error is a typed, privacy-preserving error from the router or a provider.
@@ -29,6 +37,7 @@ type Error struct {
 	Cause      error
 }
 
+// Error returns a summary that omits the underlying cause and payload data.
 func (err *Error) Error() string {
 	if err == nil {
 		return "<nil>"
@@ -96,6 +105,7 @@ type AggregateError struct {
 	Failures []ProviderFailure
 }
 
+// Error summarizes failures in attempt order without exposing their causes.
 func (err *AggregateError) Error() string {
 	if err == nil || len(err.Failures) == 0 {
 		return "lingomux: all providers failed"
