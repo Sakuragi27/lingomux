@@ -1,0 +1,281 @@
+package google
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/Sakuragi27/lingomux"
+)
+
+func TestNewValidatesConfiguration(t *testing.T) {
+	tests := []struct {
+		name   string
+		config Config
+	}{
+		{name: "missing API key", config: Config{}},
+		{name: "whitespace API key", config: Config{APIKey: " \t"}},
+		{name: "relative base URL", config: Config{APIKey: "key", BaseURL: "/relative"}},
+		{name: "unsupported URL scheme", config: Config{APIKey: "key", BaseURL: "ftp://example.test"}},
+		{name: "URL query", config: Config{APIKey: "key", BaseURL: "https://example.test?x=1"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := New(test.config)
+			if !lingomux.IsKind(err, lingomux.ErrorInvalidRequest) {
+				t.Fatalf("New() error = %v, want invalid_request", err)
+			}
+		})
+	}
+}
+
+func TestProviderNameAndInterface(t *testing.T) {
+	provider, err := New(Config{APIKey: "key"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	var _ lingomux.Provider = provider
+	if got := provider.Name(); got != "google" {
+		t.Errorf("Name() = %q, want google", got)
+	}
+}
+
+func TestSupportsUsesExplicitLanguageMaps(t *testing.T) {
+	provider, err := New(Config{APIKey: "key"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	tests := []struct {
+		name   string
+		source string
+		target string
+		want   bool
+	}{
+		{name: "auto source", source: lingomux.AutoLanguage, target: "en", want: true},
+		{name: "canonical pair", source: "en", target: "zh-CN", want: true},
+		{name: "traditional Chinese preserved", source: "zh-TW", target: "en", want: true},
+		{name: "Brazilian Portuguese deliberate mapping", source: "en", target: "pt-BR", want: true},
+		{name: "auto target", source: "en", target: lingomux.AutoLanguage, want: false},
+		{name: "unlisted region is not stripped", source: "en-US", target: "fr", want: false},
+		{name: "unknown source", source: "xx", target: "fr", want: false},
+		{name: "unknown target", source: "en", target: "xx", want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := provider.Supports(test.source, test.target); got != test.want {
+				t.Errorf("Supports(%q, %q) = %t, want %t", test.source, test.target, got, test.want)
+			}
+		})
+	}
+}
+
+func TestTranslateSendsGoogleBasicV2RequestAndParsesSuccess(t *testing.T) {
+	const apiKey = "query-key-secret"
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if got, want := request.URL.Path, "/language/translate/v2"; got != want {
+			t.Errorf("path = %q, want %q", got, want)
+		}
+		if got := request.URL.Query().Get("key"); got != apiKey {
+			t.Errorf("key query = %q, want configured key", got)
+		}
+		if request.Method != http.MethodPost {
+			t.Errorf("method = %q, want POST", request.Method)
+		}
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if got := payload["q"]; got != "Hello & goodbye" {
+			t.Errorf("q = %#v, want input text", got)
+		}
+		if got := payload["target"]; got != "zh-TW" {
+			t.Errorf("target = %#v, want zh-TW", got)
+		}
+		if got := payload["format"]; got != "text" {
+			t.Errorf("format = %#v, want text", got)
+		}
+		if _, exists := payload["source"]; exists {
+			t.Errorf("source was present for auto source: %#v", payload["source"])
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(writer, `{"data":{"translations":[{"translatedText":"你好 &amp;amp; 再見","detectedSourceLanguage":"en"}]}}`)
+	}))
+	defer server.Close()
+
+	provider, err := New(Config{APIKey: apiKey, BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := provider.Translate(context.Background(), lingomux.Request{
+		Text:           "Hello & goodbye",
+		SourceLanguage: lingomux.AutoLanguage,
+		TargetLanguage: "zh-TW",
+	})
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	if got, want := result.Text, "你好 &amp; 再見"; got != want {
+		t.Errorf("text = %q, want %q (decode HTML entities exactly once)", got, want)
+	}
+	if got, want := result.SourceLanguage, "en"; got != want {
+		t.Errorf("source = %q, want %q", got, want)
+	}
+}
+
+func TestTranslateMapsExplicitLanguagesWithoutRegionGuessing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Fatalf("decode payload: %v", err)
+		}
+		if got := payload["source"]; got != "zh-CN" {
+			t.Errorf("source = %#v, want zh-CN", got)
+		}
+		if got := payload["target"]; got != "pt" {
+			t.Errorf("target = %#v, want explicit Google pt mapping for pt-BR", got)
+		}
+		_, _ = io.WriteString(writer, `{"data":{"translations":[{"translatedText":"olá"}]}}`)
+	}))
+	defer server.Close()
+
+	provider, err := New(Config{APIKey: "key", BaseURL: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	result, err := provider.Translate(context.Background(), lingomux.Request{
+		Text: "你好", SourceLanguage: "zh-CN", TargetLanguage: "pt-BR",
+	})
+	if err != nil {
+		t.Fatalf("Translate() error = %v", err)
+	}
+	if result.SourceLanguage != "zh-CN" {
+		t.Errorf("source = %q, want explicit request source zh-CN", result.SourceLanguage)
+	}
+}
+
+func TestTranslateMapsHTTPFailures(t *testing.T) {
+	tests := []struct {
+		status    int
+		kind      lingomux.ErrorKind
+		retryable bool
+	}{
+		{status: http.StatusBadRequest, kind: lingomux.ErrorInvalidRequest, retryable: false},
+		{status: http.StatusUnauthorized, kind: lingomux.ErrorAuthentication, retryable: false},
+		{status: http.StatusForbidden, kind: lingomux.ErrorAuthentication, retryable: false},
+		{status: http.StatusTooManyRequests, kind: lingomux.ErrorRateLimited, retryable: true},
+		{status: http.StatusInternalServerError, kind: lingomux.ErrorUnavailable, retryable: true},
+		{status: http.StatusServiceUnavailable, kind: lingomux.ErrorUnavailable, retryable: true},
+		{status: http.StatusTeapot, kind: lingomux.ErrorProviderFailure, retryable: false},
+	}
+	for _, test := range tests {
+		t.Run(http.StatusText(test.status), func(t *testing.T) {
+			const rawBody = "raw-provider-response-secret"
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				writer.WriteHeader(test.status)
+				_, _ = io.WriteString(writer, rawBody)
+			}))
+			defer server.Close()
+			provider, err := New(Config{APIKey: "key", BaseURL: server.URL, HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			_, err = provider.Translate(context.Background(), validRequest())
+			assertProviderError(t, err, test.kind, test.status, test.retryable)
+			if strings.Contains(err.Error(), rawBody) {
+				t.Errorf("error leaked response body: %q", err)
+			}
+		})
+	}
+}
+
+func TestTranslateRejectsMalformedAndEmptySuccessResponses(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "malformed JSON", body: `{"data":`},
+		{name: "empty translations", body: `{"data":{"translations":[]}}`},
+		{name: "empty text", body: `{"data":{"translations":[{"translatedText":""}]}}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, test.body)
+			}))
+			defer server.Close()
+			provider, err := New(Config{APIKey: "key", BaseURL: server.URL, HTTPClient: server.Client()})
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+
+			_, err = provider.Translate(context.Background(), validRequest())
+			assertProviderError(t, err, lingomux.ErrorProviderFailure, http.StatusOK, true)
+			if strings.Contains(err.Error(), test.body) {
+				t.Errorf("error leaked response body: %q", err)
+			}
+		})
+	}
+}
+
+func TestTranslateMapsTransportErrorsAndCancellation(t *testing.T) {
+	transportCause := errors.New("transport failed with api-secret and source-secret")
+	provider, err := New(Config{
+		APIKey:  "api-secret",
+		BaseURL: "https://google.test",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, transportCause
+		})},
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_, err = provider.Translate(context.Background(), validRequest())
+	assertProviderError(t, err, lingomux.ErrorUnavailable, 0, true)
+	if !errors.Is(err, transportCause) {
+		t.Errorf("error does not retain transport cause: %v", err)
+	}
+	for _, secret := range []string{"api-secret", "source-secret"} {
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("error leaked %q: %q", secret, err)
+		}
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = provider.Translate(canceled, validRequest())
+	assertProviderError(t, err, lingomux.ErrorTimeout, 0, true)
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error does not retain context cancellation: %v", err)
+	}
+}
+
+func validRequest() lingomux.Request {
+	return lingomux.Request{
+		Text:           "source-secret",
+		SourceLanguage: lingomux.AutoLanguage,
+		TargetLanguage: "fr",
+	}
+}
+
+func assertProviderError(t *testing.T, err error, kind lingomux.ErrorKind, status int, retryable bool) {
+	t.Helper()
+	var typed *lingomux.Error
+	if !errors.As(err, &typed) {
+		t.Fatalf("error type = %T, want *lingomux.Error", err)
+	}
+	if typed.Kind != kind || typed.Provider != "google" || typed.StatusCode != status || typed.Retryable != retryable {
+		t.Errorf("error = %#v, want kind=%s provider=google status=%d retryable=%t", typed, kind, status, retryable)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return function(request)
+}
