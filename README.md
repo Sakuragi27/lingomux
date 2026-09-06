@@ -8,9 +8,25 @@ The built-in adapters use the REST APIs for Google Cloud Translation Basic v2, M
 
 LingoMux requires Go 1.26 or newer.
 
+Until the first release is tagged, install the current implementation from its feature branch:
+
 ```sh
-go get github.com/Sakuragi27/lingomux
+go get github.com/Sakuragi27/lingomux@feature/lingomux-library
 ```
+
+After it is merged, the default branch can be installed with:
+
+```sh
+go get github.com/Sakuragi27/lingomux@main
+```
+
+For normal application use, prefer a tagged version. After `v0.1.0` is published:
+
+```sh
+go get github.com/Sakuragi27/lingomux@v0.1.0
+```
+
+Application imports always use `github.com/Sakuragi27/lingomux` (and its provider package paths); the branch, tag, commit, or generated pseudo-version is recorded in the application go.mod.
 
 The module uses only the Go standard library.
 
@@ -83,7 +99,33 @@ Syntax validity does not imply provider support. Adapters use explicit mappings 
 
 ## Provider configuration
 
-Credentials are instance-scoped constructor arguments. LingoMux itself never reads environment variables, configuration files, or global process state. Every built-in config also accepts an optional `*http.Client` for transport control and testing.
+### Credential ownership
+
+Credentials belong to the calling application. Read them from environment variables, a configuration center, or a secret manager, then pass them once when constructing each provider. Do not hard-code credentials or commit them to source control.
+
+```go
+googleProvider, err := google.New(google.Config{
+    APIKey: os.Getenv("GOOGLE_TRANSLATE_API_KEY"),
+})
+if err != nil {
+    return err
+}
+
+client, err := lingomux.New(lingomux.WithProviders(googleProvider))
+if err != nil {
+    return err
+}
+
+result, err := client.Translate(ctx, lingomux.Request{
+    Text:           message,
+    SourceLanguage: lingomux.AutoLanguage,
+    TargetLanguage: "zh-CN",
+})
+```
+
+LingoMux never reads environment variables, configuration files, or global process state, and it does not persist credentials. A key is not passed on each `Translate` call. Constructed clients and built-in providers can be reused concurrently; to rotate a key, construct a new provider and client, then swap them at the application boundary.
+
+Every built-in config also accepts an optional `*http.Client` for transport control and testing.
 
 ### Google Cloud Translation
 
