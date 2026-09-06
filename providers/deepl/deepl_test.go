@@ -135,6 +135,7 @@ func TestSupportsUsesSeparateExplicitSourceAndTargetMaps(t *testing.T) {
 		{name: "Portuguese source uses source map", source: "pt-BR", target: "en", want: true},
 		{name: "auto target", source: "en", target: lingomux.AutoLanguage, want: false},
 		{name: "documented Arabic target", source: "en", target: "ar", want: true},
+		{name: "Hindi", source: "hi", target: "en", want: true},
 		{name: "unlisted source region is not stripped", source: "en-US", target: "fr", want: false},
 		{name: "unknown source", source: "xx", target: "fr", want: false},
 		{name: "unknown target", source: "en", target: "xx", want: false},
@@ -202,7 +203,7 @@ func TestTranslateMapsDetectedDeepLLanguagesToCanonical(t *testing.T) {
 		want     string
 	}{
 		{name: "English", detected: "EN", want: "en"},
-		{name: "Chinese without a script distinction", detected: "ZH", want: "zh"},
+		{name: "Chinese defaults to simplified for reusable detection", detected: "ZH", want: "zh-CN"},
 		{name: "Portuguese", detected: "PT", want: "pt"},
 		{name: "unknown vendor code", detected: "XX-VENDOR", want: ""},
 	}
@@ -226,6 +227,18 @@ func TestTranslateMapsDetectedDeepLLanguagesToCanonical(t *testing.T) {
 				t.Errorf("source = %q, want %q", result.SourceLanguage, test.want)
 			}
 		})
+	}
+}
+
+func TestDetectedLanguagesCanBeReusedAsTargets(t *testing.T) {
+	provider, err := New(Config{APIKey: "key"})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	for vendorCode, canonical := range deepLToCanonical {
+		if !provider.Supports(lingomux.AutoLanguage, canonical) {
+			t.Errorf("detected language %q maps to %q, which cannot be reused as a target", vendorCode, canonical)
+		}
 	}
 }
 

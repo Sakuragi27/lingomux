@@ -86,13 +86,13 @@ if errors.As(err, &aggregate) {
 
 The public API accepts a deliberately small BCP 47-style syntax: a two- or three-letter language, optionally a four-letter script, and optionally a two-letter or three-digit region. It canonicalizes casing (`EN` to `en`, `zh-hant-tw` to `zh-Hant-TW`). `auto` is valid only as a source language; when a provider cannot report an auto-detected source, the result contains `und`.
 
-Syntax validity does not imply provider support. Adapters use explicit mappings and do not guess by stripping scripts or regions. `Provider.Supports(source, target)` is the authoritative runtime check. Current built-in mappings are:
+Syntax validity does not imply provider support. Adapters use explicit mappings and do not guess by stripping scripts or regions. `Provider.Supports(source, target)` is the authoritative runtime check. Current built-in mappings are listed below. This is the language set implemented by LingoMux, not the complete language catalog advertised by each vendor:
 
 | Provider | Canonical tags accepted by `Supports` |
 | --- | --- |
-| Google | `ar`, `de`, `en`, `es`, `fr`, `hi`, `it`, `ja`, `ko`, `pt`, `pt-BR`, `ru`, `zh-CN`, `zh-TW` |
-| Microsoft | `ar`, `de`, `en`, `es`, `fr`, `hi`, `it`, `ja`, `ko`, `pt`, `pt-BR`, `pt-PT`, `ru`, `zh-CN`, `zh-TW` |
-| DeepL | `ar`, `bg`, `cs`, `da`, `de`, `el`, `en`, `es`, `et`, `fi`, `fr`, `he`, `hu`, `id`, `it`, `ja`, `ko`, `lt`, `lv`, `nb`, `nl`, `pl`, `pt`, `pt-BR`, `ro`, `ru`, `sk`, `sl`, `sv`, `th`, `tr`, `uk`, `vi`, `zh-CN`, `zh-TW` |
+| Google | `ar`, `de`, `en`, `es`, `fr`, `hi`, `id`, `it`, `ja`, `ko`, `pt`, `pt-BR`, `ru`, `th`, `vi`, `zh-CN`, `zh-TW` |
+| Microsoft | `ar`, `de`, `en`, `es`, `fr`, `hi`, `id`, `it`, `ja`, `ko`, `pt`, `pt-BR`, `pt-PT`, `ru`, `th`, `vi`, `zh-CN`, `zh-TW` |
+| DeepL | `ar`, `bg`, `cs`, `da`, `de`, `el`, `en`, `es`, `et`, `fi`, `fr`, `he`, `hi`, `hu`, `id`, `it`, `ja`, `ko`, `lt`, `lv`, `nb`, `nl`, `pl`, `pt`, `pt-BR`, `ro`, `ru`, `sk`, `sl`, `sv`, `th`, `tr`, `uk`, `vi`, `zh-CN`, `zh-TW` |
 | OpenAI | `ar`, `bg`, `cs`, `da`, `de`, `el`, `en`, `es`, `et`, `fi`, `fr`, `he`, `hi`, `hu`, `id`, `it`, `ja`, `ko`, `lt`, `lv`, `nb`, `nl`, `pl`, `pt`, `pt-BR`, `ro`, `ru`, `sk`, `sl`, `sv`, `th`, `tr`, `uk`, `vi`, `zh-CN`, `zh-TW` |
 
 `auto` is additionally accepted as the source by all four built-in adapters. DeepL keeps distinct source and target maps; for example, it maps regional Chinese and Portuguese source tags to the generic vendor source codes while preserving supported target variants. The providers do not all support every syntactically valid canonical tag or the same set of variants.
